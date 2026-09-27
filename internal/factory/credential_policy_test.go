@@ -143,8 +143,75 @@ func TestCubeEgressConfigRejectsPlaintextRemoteControlPlane(t *testing.T) {
 		Binary: "/host/runner", BinarySHA256: strings.Repeat("a", 64), Model: "model",
 		Timeout: tomlx.FromStd(time.Minute),
 	}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "HTTPS or loopback") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires HTTPS") {
 		t.Fatalf("Validate error = %v", err)
+	}
+}
+
+func TestOpenCodeCubeEgressInjectsCredentialOnlyInProxy(t *testing.T) {
+	const secret = "provider-secret-must-stay-in-proxy"
+	t.Setenv("TEST_ESF_OPENCODE_KEY", secret)
+	cfg := testValidConfigForCredentialPolicy()
+	cfg.Harnesses["opencode"] = HarnessConfig{
+		Type: "opencode", BaseURL: "https://gateway.example/v1", Model: "gateway/model",
+		APIKeyEnv: "TEST_ESF_OPENCODE_KEY", CredentialMode: cubeEgressCredentialMode,
+		Binary: "/host/opencode", BinarySHA256: strings.Repeat("a", 64), Timeout: tomlx.FromStd(time.Minute),
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	network, applies, err := cfg.runtimeNetworkForHarness("opencode")
+	if err != nil || !applies {
+		t.Fatalf("policy: applies=%v error=%v", applies, err)
+	}
+	if got := network.Rules[0].Action.Inject[0].Secret; got != secret {
+		t.Fatalf("proxy secret = %q", got)
+	}
+	if len(network.Rules) != 1 || network.Rules[0].Match.Host != "gateway.example" || *network.AllowInternet {
+		t.Fatalf("unsafe policy: %+v", network)
+	}
+	if _, err := cfg.BuildHarnesses(); err != nil {
+		t.Fatalf("harness: %v", err)
+	}
+	unsafe := cfg.Harnesses["opencode"]
+	unsafe.PassEnv = []string{"TEST_ESF_OPENCODE_KEY"}
+	cfg.Harnesses["opencode"] = unsafe
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "forbids pass_env") {
+		t.Fatalf("config accepted agent-readable host credential: %v", err)
+	}
+	if _, err := cfg.BuildHarnesses(); err == nil {
+		t.Fatal("accepted agent-readable host credential")
+	}
+}
+
+func TestOpenCodeGoCredentialFileScopesEgressToChatAPI(t *testing.T) {
+	key := filepath.Join(t.TempDir(), "opencode-go.key")
+	if err := os.WriteFile(key, []byte("test-go-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testValidConfigForCredentialPolicy()
+	cfg.Harnesses["opencode-go"] = HarnessConfig{
+		Type: "opencode", BaseURL: "https://opencode.ai/zen/go/v1",
+		Model: "opencode-go/deepseek-v4.1-flash", APIKeyFile: key,
+		CredentialMode: cubeEgressCredentialMode, Binary: "/host/opencode",
+		BinarySHA256: strings.Repeat("a", 64), Timeout: tomlx.FromStd(time.Minute),
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	network, applies, err := cfg.runtimeNetworkForHarness("opencode-go")
+	if err != nil || !applies {
+		t.Fatalf("policy: applies=%v error=%v", applies, err)
+	}
+	if len(network.Rules) != 1 || len(network.Rules[0].Action.Inject) != 1 {
+		t.Fatalf("unexpected network policy: %+v", network)
+	}
+	rule := network.Rules[0]
+	if rule.Match.Host != "opencode.ai" || rule.Match.SNI != "opencode.ai" ||
+		rule.Match.Path != "/zen/go/v1/*" || len(rule.Match.Method) != 1 ||
+		rule.Match.Method[0] != "POST" || rule.Action.Inject[0].Secret != "test-go-key" ||
+		*network.AllowInternet {
+		t.Fatalf("unsafe OpenCode Go rule: %+v", rule)
 	}
 }
 
